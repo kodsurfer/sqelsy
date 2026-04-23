@@ -101,3 +101,133 @@ WHERE idx_scan = 0
     Объект: Таблица и колонка.
     Рекомендация: Готовый SQL-запрос CREATE INDEX ....
     Обоснование: Почему это важно (например, "Ускорит JOIN с таблицей X").
+
+
+Go идеально подходит для CLI-инструментов: он компилируется в один бинарный файл, быстро работает и отлично справляется с параллельными запросами к БД.
+Для работы нам понадобятся:
+
+    pgx — лучший драйвер для PostgreSQL.
+    cobra — стандарт де-факто для создания CLI (флаги, команды).
+
+Скелет реализации на Go
+Ниже представлен базовый код инструмента, который реализует проверку отсутствующих индексов на Foreign Keys.
+1. Структура проекта
+bash
+
+.
+├── main.go
+├── checker/
+│   └── indexes.go   # Логика проверок
+└── db/
+    └── postgres.go  # Подключение к БД
+
+Используйте код с осторожностью.
+2. Основная логика (checker/indexes.go)
+Создадим структуру для отчета и функцию выполнения запроса.
+go
+
+package checker
+
+import (
+	"context"
+	"fmt"
+	"://github.com"
+)
+
+type Suggestion struct {
+	CheckName   string
+	Table       string
+	Description string
+	Remediation string
+}
+
+const fkMissingIndexQuery = `
+SELECT
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    array_to_string(array_agg(a.attname), ', ') AS columns
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(con.conkey)
+WHERE con.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = con.conrelid
+      AND (i.indkey::int2[])[0:cardinality(con.conkey)-1] @> con.conkey
+  )
+GROUP BY c.relname, con.conname;`
+
+func CheckMissingFKIndexes(ctx context.Context, conn *pgx.Conn) ([]Suggestion, error) {
+	rows, err := conn.Query(ctx, fkMissingIndexQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var suggestions []Suggestion
+	for rows.Next() {
+		var table, constraint, columns string
+		if err := rows.Scan(&table, &constraint, &columns); err != nil {
+			return nil, err
+		}
+		suggestions = append(suggestions, Suggestion{
+			CheckName:   "MISSING_FK_INDEX",
+			Table:       table,
+			Description: fmt.Sprintf("Foreign key '%s' on columns (%s) is not indexed.", constraint, columns),
+			Remediation: fmt.Sprintf("CREATE INDEX idx_%s_%s ON %s (%s);", table, constraint, table, columns),
+		})
+	}
+	return suggestions, nil
+}
+
+Используйте код с осторожностью.
+3. Точка входа (main.go)
+Минимальный код для запуска:
+go
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+
+	"://github.com"
+	"your_project/checker"
+)
+
+func main() {
+	// В реальном приложении используйте флаги cobra или переменные окружения
+	connStr := "postgres://user:password@localhost:5432/dbname"
+	ctx := context.Background()
+
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close(ctx)
+
+	fmt.Println("🚀 Starting SQL Schema Style Checker...")
+	
+	suggestions, err := checker.CheckMissingFKIndexes(ctx, conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if len(suggestions) == 0 {
+		fmt.Println("✅ No issues found in indexes!")
+		return
+	}
+
+	for _, s := range suggestions {
+		fmt.Printf("[%s] Table: %s\n", s.CheckName, s.Table)
+		fmt.Printf("Issue: %s\n", s.Description)
+		fmt.Printf("Fix:   %s\n\n", s.Remediation)
+	}
+}
+
+    Интерфейс: Вы можете создать интерфейс Rule, у которого будет метод Run(conn), и просто добавить слайс из всех правил.
+    Форматирование: Легко добавить флаг --format=json для интеграции в CI/CD.
+    Параллелизм: Если проверок станет очень много (сотни), Go позволит запускать их в разных горутинах.
