@@ -40,3 +40,64 @@ AND NOT EXISTS (
 );
 
 Кстати, подобные инструменты уже начинают появляться (например, SchemaSpy для визуализации или sql-lint), но кастомный чекер под специфику может быть полезнее.
+
+
+Для реализации CLI-инструмента на Python или Go вам понадобятся SQL-запросы к системным таблицам pg_catalog. Вот три базовых правила, с которых стоит начать:
+1. Поиск Foreign Keys без индексов
+Запрос для чекера:
+sql
+
+SELECT
+    c.relname AS table_name,
+    con.conname AS constraint_name,
+    confrel.relname AS referenced_table
+FROM pg_constraint con
+JOIN pg_class c ON c.oid = con.conrelid
+JOIN pg_class confrel ON confrel.oid = con.confrelid
+WHERE con.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = con.conrelid
+      AND (i.indkey::int2[])[0:cardinality(con.conkey)-1] @> con.conkey
+  );
+
+Используйте код с осторожностью.
+2. Поиск дублирующих или избыточных индексов
+Часто разработчики создают индекс на (a, b) и отдельно на (a). Второй индекс в Postgres избыточен, так как первый может обслуживать запросы по префиксу.
+Запрос для чекера:
+sql
+
+SELECT
+    ind1.relname AS table_name,
+    i1.relname AS redundant_index,
+    i2.relname AS covering_index
+FROM pg_index x1
+JOIN pg_class ind1 ON ind1.oid = x1.indrelid
+JOIN pg_class i1 ON i1.oid = x1.indexrelid
+JOIN pg_index x2 ON x2.indrelid = x1.indrelid AND x1.indexrelid <> x2.indexrelid
+JOIN pg_class i2 ON i2.oid = x2.indexrelid
+WHERE (x2.indkey::int2[])[0:cardinality(x1.indkey)-1] = x1.indkey
+  AND x1.indisunique IS FALSE; -- Уникальные индексы не трогаем
+
+Используйте код с осторожностью.
+3. Поиск неиспользуемых индексов
+Индексы замедляют вставку и обновление. Если индекс не использовался с момента запуска БД, его стоит удалить.
+sql
+
+SELECT
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan AS scan_count
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+  AND indisunique IS FALSE -- Не предлагаем удалять PK или Unique
+  AND schemaname = 'public';
+
+Используйте код с осторожностью.
+Архитектура CLI-инструмента
+Чтобы инструмент был удобным, я рекомендую такую структуру вывода:
+
+    Название проверки (например, [MISSING_FK_INDEX]).
+    Объект: Таблица и колонка.
+    Рекомендация: Готовый SQL-запрос CREATE INDEX ....
+    Обоснование: Почему это важно (например, "Ускорит JOIN с таблицей X").
