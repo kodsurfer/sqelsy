@@ -231,3 +231,75 @@ func main() {
     Интерфейс: Вы можете создать интерфейс Rule, у которого будет метод Run(conn), и просто добавить слайс из всех правил.
     Форматирование: Легко добавить флаг --format=json для интеграции в CI/CD.
     Параллелизм: Если проверок станет очень много (сотни), Go позволит запускать их в разных горутинах.
+
+
+
+Для расширения функционала Go-инструмента добавим новые правила проверки, обращаясь к системному каталогу information_schema. Это позволит находить фундаментальные ошибки проектирования до того, как они попадут в продакшн.
+1. Проверка Ключей (Keys)
+Основная задача здесь — найти таблицы, у которых отсутствует PRIMARY KEY. Без него невозможна эффективная репликация (Logical Replication) и уникальная идентификация строк. 
+Запрос для Go-чекера:
+sql
+
+SELECT table_name
+FROM information_schema.tables
+WHERE table_type = 'BASE TABLE'
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND table_name NOT IN (
+      SELECT table_name
+      FROM information_schema.table_constraints
+      WHERE constraint_type = 'PRIMARY KEY'
+  );
+
+Используйте код с осторожностью.
+2. Проверка Типов Данных (Data Types)
+Помогает оптимизировать хранение. Например, замена устаревшего JSON на JSONB или поиск текстовых полей, которые лучше хранить как UUID или TIMESTAMPTZ. 
+Запрос для поиска использования JSON вместо JSONB:
+sql
+
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE data_type = 'json' 
+  AND table_schema = 'public';
+
+Используйте код с осторожностью.
+3. Проверка Нейминга (Naming Conventions)
+Хороший тон в PostgreSQL — использование snake_case. Проблемы возникают, когда используются кавычки для создания имен с заглавными буквами (например, "UserName"), что делает SQL-запросы чувствительными к регистру. 
+Проверки на плохой нейминг:
+
+    Регистр: Поиск имен с заглавными буквами (требуют кавычек).
+    Зарезервированные слова: Использование слов вроде order, user, table в качестве имен.
+    Плюрализация: Таблицы должны быть во множественном числе (например, users вместо user). 
+
+Запрос для поиска имен с заглавными буквами:
+sql
+
+SELECT table_name AS object_name, 'TABLE' AS type
+FROM information_schema.tables
+WHERE table_name ~ '[A-Z]' AND table_schema = 'public'
+UNION ALL
+SELECT column_name, 'COLUMN'
+FROM information_schema.columns
+WHERE column_name ~ '[A-Z]' AND table_schema = 'public';
+
+Обновленная структура Go-кода
+Рекомендуется использовать паттерн со слайсом правил, чтобы легко добавлять новые проверки:
+go
+
+type Rule struct {
+    Name string
+    SQL  string
+    Fix  func(table, col string) string
+}
+
+var rules = []Rule{
+    {
+        Name: "MISSING_PK",
+        SQL:  "/* SQL запрос для PK */",
+        Fix:  func(t, c string) string { return fmt.Sprintf("ALTER TABLE %s ADD PRIMARY KEY (id);", t) },
+    },
+    {
+        Name: "JSON_INSTEAD_JSONB",
+        SQL:  "/* SQL запрос для JSON */",
+        Fix:  func(t, c string) string { return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE jsonb;", t, c) },
+    },
+}
